@@ -6,9 +6,14 @@
 #   underlying's own pattern scan already found for it.
 #
 #   Two symbol formats recognized, tried in order:
-#     - Fidelity/OCC-packed: "-AAPL251219C00200000" (optional leading
-#       "-", YYMMDD, no separators, 8-digit strike = dollars*1000).
-#       Verified against a real Fidelity export.
+#     - OCC-packed: "-AAPL251219C00200000" (optional leading "-",
+#       YYMMDD, no separators, 8-digit strike = dollars*1000).
+#       Verified against a real Fidelity export. thinkorswim is known
+#       to also use real OCC symbols (sometimes space-padded, e.g.
+#       "AAPL  251219C00200000") — the space-stripping before this
+#       regex already handles that padding, so thinkorswim should
+#       work here too, but that's inferred, not yet confirmed against
+#       a real thinkorswim export.
 #     - Schwab-style human-readable: "AAPL 01/17/2025 150.00 C"
 #       (MM/DD/YYYY, decimal strike, space-separated). Best-effort
 #       from Schwab's publicly documented export format — NOT yet
@@ -20,6 +25,12 @@
 #   doesn't match either pattern is surfaced as "unparsed" rather than
 #   silently dropped, specifically so this failure mode is visible
 #   instead of quietly losing a position.
+#
+#   Equity-side column names (Quantity/Qty, cost basis, last
+#   price/Mark) and thinkorswim's multi-section CSV layout (separate
+#   Equities/Options/Futures tables stacked in one file, each with
+#   its own header row) are handled by modules.ticker_universe's
+#   read_broker_csv() — also best-effort/unverified for thinkorswim.
 # ==================================================================
 import os
 import re
@@ -98,26 +109,27 @@ def get_option_positions(log=print) -> pd.DataFrame:
     Returns an empty DataFrame (not an error) if there's no CSV, no
     option rows, or neither — a portfolio with no options open isn't
     a failure state."""
-    from modules.ticker_universe import resolve_portfolio_csv_path
+    from modules.ticker_universe import resolve_portfolio_csv_path, read_broker_csv
 
     csv_path = resolve_portfolio_csv_path()
     if not os.path.exists(csv_path):
         return pd.DataFrame()
 
-    df = pd.read_csv(csv_path, index_col=False)
+    df = read_broker_csv(csv_path)
     df.columns = [c.strip() for c in df.columns]
     if "Symbol" not in df.columns:
         return pd.DataFrame()
 
     lower_map = {c.lower(): c for c in df.columns}
-    qty_col = lower_map.get("quantity")
-    # Fidelity's cost basis columns are already per-share; Schwab's
-    # "Cost Basis" is a TOTAL, divided by quantity below instead of
-    # being treated the same way (see modules/ticker_universe.py's
-    # get_open_positions for the equivalent equity-side handling).
-    cost_col = lower_map.get("average cost basis") or lower_map.get("cost basis per share")
+    qty_col = lower_map.get("quantity") or lower_map.get("qty")
+    # Fidelity/thinkorswim's cost basis columns are already per-share
+    # ("Trade Price" for thinkorswim); Schwab's "Cost Basis" is a
+    # TOTAL, divided by quantity below instead of being treated the
+    # same way (see modules/ticker_universe.py's get_open_positions
+    # for the equivalent equity-side handling).
+    cost_col = lower_map.get("average cost basis") or lower_map.get("cost basis per share") or lower_map.get("trade price")
     total_cost_col = None if cost_col else lower_map.get("cost basis")
-    price_col = lower_map.get("last price") or lower_map.get("price")
+    price_col = lower_map.get("last price") or lower_map.get("price") or lower_map.get("mark")
     desc_col = lower_map.get("description")
 
     rows = []

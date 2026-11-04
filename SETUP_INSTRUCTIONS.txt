@@ -1,8 +1,9 @@
 Stock Screener - Setup
 ======================
 
-1. Export your Positions from Schwab as a CSV, save it anywhere
-   inside the "inputs" folder (any filename is fine).
+1. Export your Positions as a CSV (from Schwab's website or from
+   thinkorswim's Position Statement) and save it anywhere inside the
+   "inputs" folder (any filename is fine).
 
 2. Double-click RUN_SCREENER.bat.
    - If Python isn't installed yet, it installs it automatically
@@ -20,8 +21,8 @@ Stock Screener - Setup
    week, not daily.
 
 Options support is new and hasn't been checked against a real Schwab
-export yet - if a held option doesn't show up on the "My Options"
-sheet, send back one example row from your real Positions CSV
+or thinkorswim export yet - if a held position or option doesn't show
+up right, send back one example row from your real Positions CSV
 (symbol/column format only, blank out dollar amounts if you want) and
 it can be fixed quickly.
 

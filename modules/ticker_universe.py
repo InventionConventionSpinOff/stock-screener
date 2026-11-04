@@ -6,8 +6,10 @@
 # ==================================================================
 import os
 import sys
+import csv
 import json
 import time
+import io
 import datetime as dt
 from pathlib import Path
 
@@ -49,6 +51,68 @@ SEC_HEADERS = {
 # Your own holdings (broker "Positions" CSV export — Fidelity or
 # Schwab, see module/options.py docstring for format support notes)
 # ------------------------------------------------------------------
+# Thinkorswim's "Position Statement" export stacks SEPARATE tables in
+# one CSV — an Equities table, then an Options table, then a Futures
+# table, etc., each with its OWN header row, rather than Fidelity/
+# Schwab's one flat table. read_broker_csv() below handles both: a
+# flat file is just the trivial case of one section. Best-effort —
+# NOT yet verified against a real thinkorswim export, since none was
+# available when this was written. If it doesn't parse your real
+# file, tell me a real example row (redact dollar amounts if you
+# want) and I'll correct it.
+_SECTION_HEADER_HINTS = {"symbol", "instrument", "ticker"}
+
+
+def read_broker_csv(csv_path) -> pd.DataFrame:
+    """Reads a broker Positions CSV that may contain either one flat
+    table (Fidelity, Schwab) or several stacked tables each with their
+    own header row (thinkorswim's Equities/Options/Futures sections).
+    Returns a single DataFrame — the union of every section's columns,
+    missing values as NaN for rows from a section that didn't have
+    that column. Downstream code (get_traded_tickers, get_open_positions,
+    modules.options.get_option_positions) is section-agnostic: it just
+    looks for whichever column names it recognizes, wherever they are."""
+    with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        raw_rows = list(csv.reader(f))
+
+    sections = []
+    current_header = None
+    current_rows = []
+    for row in raw_rows:
+        cells = [c.strip() for c in row]
+        non_empty = [c for c in cells if c]
+        is_header = len(non_empty) >= 2 and any(c.lower() in _SECTION_HEADER_HINTS for c in cells)
+        if is_header:
+            if current_header is not None and current_rows:
+                sections.append((current_header, current_rows))
+            current_header = cells
+            current_rows = []
+        elif current_header is not None and len(non_empty) >= 2:
+            # A lone single-cell line (e.g. a section title like
+            # "Options" sitting on its own line above its real column
+            # header, or a blank spacer row) is never a real data row
+            # in any broker's position export — skip it rather than
+            # let it bleed into the PRIOR section as a bogus row with
+            # that one word as the "Symbol".
+            current_rows.append(row)
+    if current_header is not None and current_rows:
+        sections.append((current_header, current_rows))
+
+    if not sections:
+        # No recognizable header anywhere — fall back to pandas'
+        # normal single-table assumption so a plain, simple export
+        # (or one this heuristic doesn't understand) still has a
+        # chance of working rather than returning nothing.
+        return pd.read_csv(csv_path, index_col=False)
+
+    frames = []
+    for header, rows in sections:
+        width = len(header)
+        normalized_rows = [r[:width] + [""] * (width - len(r)) for r in rows]
+        frames.append(pd.DataFrame(normalized_rows, columns=header))
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 def resolve_portfolio_csv_path():
     """PATHS["portfolio_csv"] if it exists; otherwise the first *.csv
     found in inputs/ — so a Schwab (or any other broker) export can
@@ -73,16 +137,16 @@ def get_traded_tickers() -> list:
     csv_path = resolve_portfolio_csv_path()
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
-            f"Fidelity positions CSV not found at {csv_path}. "
-            f"Export it from Fidelity (Positions -> Download) and save it there."
+            f"Broker positions CSV not found at {csv_path}. "
+            f"Export your Positions as CSV and drop it in the inputs/ folder."
         )
 
-    df = pd.read_csv(csv_path, index_col=False)
+    df = read_broker_csv(csv_path)
     df.columns = [c.strip() for c in df.columns]
     if "Symbol" not in df.columns:
         raise ValueError(
             f"Expected a 'Symbol' column in {csv_path}, found: {list(df.columns)}. "
-            f"If your Fidelity export uses different column names, tell me and "
+            f"If your export uses different column names, tell me and "
             f"I'll adjust this parser."
         )
 
@@ -95,24 +159,27 @@ def get_traded_tickers() -> list:
 
 
 # Column name candidates across the brokers this has been checked
-# against (Fidelity, verified; Schwab, best-effort from Schwab's
-# publicly documented export format — NOT yet verified against a
-# real Schwab export, since none was available when this was written.
-# If a Schwab export doesn't parse, tell me the real header names from
-# the actual file and I'll correct these.
-_QUANTITY_COLS = ["Quantity"]
-# Already a PER-SHARE cost basis in both Fidelity and Schwab exports.
-_AVG_COST_COLS = ["Average Cost Basis", "Cost Basis Per Share"]
+# against (Fidelity, verified; Schwab and thinkorswim, best-effort
+# from their publicly documented export formats — NOT yet verified
+# against a real export from either, since none was available when
+# this was written. If a real export doesn't parse, tell me the real
+# header names from the actual file and I'll correct these.
+_QUANTITY_COLS = ["Quantity", "Qty"]
+# Already a PER-SHARE cost basis in Fidelity, Schwab, and thinkorswim
+# exports (thinkorswim calls it "Trade Price" — the price you actually
+# paid, not a current/live figure).
+_AVG_COST_COLS = ["Average Cost Basis", "Cost Basis Per Share", "Trade Price"]
 # Schwab's "Cost Basis" column is the TOTAL position cost, not
 # per-share — handled separately below (divided by Quantity) rather
 # than lumped in with _AVG_COST_COLS, which would silently use the
 # total as if it were a per-share price.
 _TOTAL_COST_BASIS_COLS = ["Cost Basis"]
-_CURRENT_VALUE_COLS = ["Current Value", "Market Value"]
-_LAST_PRICE_COLS = ["Last Price", "Price"]
+_CURRENT_VALUE_COLS = ["Current Value", "Market Value", "Mark Value"]
+# thinkorswim's current per-share price is called "Mark".
+_LAST_PRICE_COLS = ["Last Price", "Price", "Mark"]
 # Cash-sweep / money-market symbols to exclude from the traded-ticker
 # universe across brokers — these aren't equities with chart patterns.
-_CASH_SWEEP_SYMBOLS = {"SPAXX", "FDRXX", "CASH", "SWVXX", "SWGXX", "SNVXX", "SNAXX", "SNSXX"}
+_CASH_SWEEP_SYMBOLS = {"SPAXX", "FDRXX", "CASH", "SWVXX", "SWGXX", "SNVXX", "SNAXX", "SNSXX", "MMDA1"}
 
 
 def _first_present(df: pd.DataFrame, candidates: list):
@@ -135,11 +202,11 @@ def get_open_positions() -> pd.DataFrame:
     csv_path = resolve_portfolio_csv_path()
     if not os.path.exists(csv_path):
         raise FileNotFoundError(
-            f"Fidelity positions CSV not found at {csv_path}. "
-            f"Export it from Fidelity (Positions -> Download) and save it there."
+            f"Broker positions CSV not found at {csv_path}. "
+            f"Export your Positions as CSV and drop it in the inputs/ folder."
         )
 
-    df = pd.read_csv(csv_path, index_col=False)
+    df = read_broker_csv(csv_path)
     df.columns = [c.strip() for c in df.columns]
     if "Symbol" not in df.columns:
         raise ValueError(f"Expected a 'Symbol' column in {csv_path}, found: {list(df.columns)}")

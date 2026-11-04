@@ -40,6 +40,33 @@ def schwab_csv(tmp_path, monkeypatch):
     yield path
 
 
+@pytest.fixture
+def thinkorswim_csv(tmp_path, monkeypatch):
+    # Multi-section layout: a lone section-title line ("Equities",
+    # "Options") sits ABOVE each section's own column-header row —
+    # this shape is what originally leaked "Options" into the ticker
+    # list as a bogus Symbol before the section-boundary fix.
+    path = tmp_path / "tos_positions.csv"
+    path.write_text(
+        "Account Statement for XXXX1234 on 11/03/26\n"
+        "\n"
+        "Cash & Sweep Vehicle\n"
+        "Symbol,Description,Qty,Mark Value\n"
+        "MMDA1,MONEY MARKET,1,500.00\n"
+        "\n"
+        "Equities\n"
+        "Symbol,Description,Qty,Trade Price,Mark,Mark Value\n"
+        "AAPL,APPLE INC,15,150.00,210.50,3157.50\n"
+        "MSFT,MICROSOFT CORP,8,250.00,340.20,2721.60\n"
+        "\n"
+        "Options\n"
+        "Symbol,Description,Qty,Trade Price,Mark,Mark Value\n"
+        "AAPL  260116C00220000,APPLE INC 16 JAN 26 220 CALL,3,3.00,4.80,1440.00\n"
+    )
+    monkeypatch.setitem(PATHS, "portfolio_csv", path)
+    yield path
+
+
 def test_fidelity_avg_cost_used_directly(fidelity_csv):
     df = ticker_universe.get_open_positions()
     row = df[df["Ticker"] == "AAPL"].iloc[0]
@@ -62,6 +89,43 @@ def test_schwab_total_cost_basis_divided_by_quantity(schwab_csv):
     # column semantics (total vs. already-per-share).
     assert row["AvgCost"] == 150.0
     assert row["LastPrice"] == 200.0
+
+
+def test_thinkorswim_multi_section_equities_parsed(thinkorswim_csv):
+    df = ticker_universe.get_open_positions()
+    tickers = set(df["Ticker"])
+    assert tickers == {"AAPL", "MSFT"}
+    aapl = df[df["Ticker"] == "AAPL"].iloc[0]
+    assert aapl["AvgCost"] == 150.0   # Trade Price
+    assert aapl["LastPrice"] == 210.5  # Mark
+    assert aapl["Quantity"] == 15
+
+
+def test_thinkorswim_section_title_line_not_leaked_as_ticker(thinkorswim_csv):
+    # Regression test: "Options" (the lone section-title line sitting
+    # above its own column-header row) used to bleed into the prior
+    # section as a bogus one-cell "data" row before the section-
+    # boundary fix, producing a fake "OPTIONS" ticker.
+    tickers = ticker_universe.get_traded_tickers()
+    assert "OPTIONS" not in tickers
+    assert "EQUITIES" not in tickers
+
+
+def test_thinkorswim_excludes_cash_sweep(thinkorswim_csv):
+    tickers = ticker_universe.get_traded_tickers()
+    assert "MMDA1" not in tickers
+
+
+def test_thinkorswim_option_section_parsed_via_options_module(thinkorswim_csv):
+    from modules.options import get_option_positions
+    opts = get_option_positions()
+    assert len(opts) == 1
+    row = opts.iloc[0]
+    assert row["Underlying"] == "AAPL"
+    assert row["OptionType"] == "CALL"
+    assert row["Strike"] == 220.0
+    assert row["AvgCost"] == 3.0   # Trade Price
+    assert row["LastPrice"] == 4.8  # Mark
 
 
 def test_resolver_prefers_configured_path_when_it_exists(fidelity_csv):
