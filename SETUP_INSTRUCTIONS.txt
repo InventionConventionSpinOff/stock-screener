@@ -1,0 +1,31 @@
+Stock Screener - Setup
+======================
+
+1. Export your Positions from Schwab as a CSV, save it anywhere
+   inside the "inputs" folder (any filename is fine).
+
+2. Double-click RUN_SCREENER.bat.
+   - If Python isn't installed yet, it installs it automatically
+     (needs internet, takes a minute or two, no admin password
+     needed). You'll just see some text scroll by - that's normal.
+   - Scans your holdings + the DJIA/S&P 500/Nasdaq-100 (~518 tickers).
+     Takes under a minute after that.
+   - Open the "outputs" folder afterward - that's your report. Start
+     with the "Legend" sheet, it explains every column.
+
+3. RUN_SCREENER_WEEKLY_ALLUS.bat scans every US-listed stock
+   (~10,000+) instead of just the major indexes. Takes 30-45+ minutes
+   the first time (gets rate-limited fetching that many tickers from
+   Yahoo Finance - that's normal, not a hang). Run it about once a
+   week, not daily.
+
+Options support is new and hasn't been checked against a real Schwab
+export yet - if a held option doesn't show up on the "My Options"
+sheet, send back one example row from your real Positions CSV
+(symbol/column format only, blank out dollar amounts if you want) and
+it can be fixed quickly.
+
+This is not financial advice - it's pattern detection + backtested
+stats, nothing more. See the "Legend" sheet in each report and the
+"ML win-probability model" line on the Summary sheet for exactly how
+much (or little) to trust any given number.

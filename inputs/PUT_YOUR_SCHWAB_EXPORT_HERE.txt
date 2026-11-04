@@ -1,0 +1,8 @@
+Export your Positions from Schwab as a CSV and save it in this folder.
+Any filename works - it's auto-detected.
+
+Options support is new and best-effort (built without a real Schwab
+export to test against) - if your options don't show up right, email
+back one example option row from your real CSV (you can blank out the
+dollar amounts/quantities, just keep the Symbol/column format) and
+it'll get fixed.
