@@ -64,14 +64,30 @@ def get_sectors(tickers: list, log=print) -> dict:
     return {t: cache.get(t, "Unknown") for t in tickers}
 
 
-def build_sector_exposure(positions_df: pd.DataFrame, log=print) -> pd.DataFrame:
+def build_sector_exposure(positions_df: pd.DataFrame, options_df: pd.DataFrame = None,
+                           log=print) -> pd.DataFrame:
     """positions_df: Ticker/Quantity/LastPrice (from get_open_positions).
+    options_df: Underlying/Quantity/LastPrice (from get_option_positions)
+    — optional, since not every run has option positions. An option's
+    dollar value uses the standard 100-share contract multiplier, and
+    is attributed to its UNDERLYING's sector (an AAPL call is still
+    Technology exposure) — same "invested dollars" convention as the
+    equity side, not a delta/notional-adjusted risk figure, so a deep
+    ITM call and a far OTM call of the same premium count the same.
     Returns Sector / MarketValue / PortfolioPct, sorted largest first."""
-    if positions_df is None or positions_df.empty:
+    frames = []
+    if positions_df is not None and not positions_df.empty:
+        eq = pd.DataFrame({"Ticker": positions_df["Ticker"]})
+        eq["MarketValue"] = positions_df["Quantity"] * positions_df["LastPrice"]
+        frames.append(eq)
+    if options_df is not None and not options_df.empty:
+        opt = pd.DataFrame({"Ticker": options_df["Underlying"]})
+        opt["MarketValue"] = options_df["Quantity"] * options_df["LastPrice"] * 100
+        frames.append(opt)
+    if not frames:
         return pd.DataFrame()
 
-    df = positions_df.copy()
-    df["MarketValue"] = df["Quantity"] * df["LastPrice"]
+    df = pd.concat(frames, ignore_index=True)
     sectors = get_sectors(df["Ticker"].tolist(), log=log)
     df["Sector"] = df["Ticker"].map(sectors)
 
@@ -98,4 +114,9 @@ if __name__ == "__main__":
         "Quantity": [2, 1, 6],
         "LastPrice": [341.07, 225.07, 33.21],
     })
-    print(build_sector_exposure(fake))
+    fake_options = pd.DataFrame({
+        "Underlying": ["AAPL"],
+        "Quantity": [3],
+        "LastPrice": [5.20],
+    })
+    print(build_sector_exposure(fake, fake_options))

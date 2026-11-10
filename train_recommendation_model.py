@@ -7,6 +7,17 @@
 #   score already used for star ratings (modules/priority.py), and
 #   volume confirmation.
 #
+#   Tried adding the broad market's Bull/Bear regime
+#   (modules.market_data.get_regime_lookup) as a 4th feature after
+#   analyze_market_regime.py found real, held-out-reproducing regime
+#   effects (e.g. Death Cross is far worse in Bear markets). It didn't
+#   move held-out AUC at any horizon (5d/10d/20d all stayed ~0.50-0.51)
+#   — the effect is real but per-pattern, and gets diluted away when
+#   blended into one classifier across all 7 patterns. Reverted; the
+#   regime finding is used directly in modules/report_screener.py
+#   instead (per-pattern stat lookup, no ML needed) rather than forcing
+#   it through this model.
+#
 #   News sentiment is deliberately NOT a feature yet — the sentiment
 #   cache (modules/news_sentiment.py) only ever stores today's
 #   snapshot, so there's no point-in-time historical sentiment to
@@ -74,6 +85,7 @@ def load_training_data(horizon: int) -> pd.DataFrame:
             f"No '{target_col}' column in {path} — that horizon wasn't part "
             f"of the backtest run that produced this cache."
         )
+
     df = df.dropna(subset=FEATURE_COLS + [target_col]).sort_values("Date").reset_index(drop=True)
     df["Win"] = (df[target_col] > 0).astype(int)
     return df

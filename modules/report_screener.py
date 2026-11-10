@@ -23,7 +23,7 @@ from modules.swing_points import swing_sequence
 from modules.news_sentiment import get_news_sentiment
 from modules.recommendation import recommend_buy
 from modules.sector_exposure import build_sector_exposure, get_sectors
-from modules.backtest import load_pattern_stats_cache, pattern_backtest_is_weak
+from modules.backtest import load_pattern_stats_cache, load_pattern_stats_by_regime_cache, pattern_backtest_is_weak
 from modules.ml_recommend import predict_win_probability, model_metadata
 
 # The forward-day horizon shown as a single summary figure on the
@@ -34,12 +34,35 @@ from modules.ml_recommend import predict_win_probability, model_metadata
 _PRIMARY_HORIZON_DAYS = 20
 
 
-def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame) -> str:
+# The 4 patterns analyze_market_regime.py found a real, held-out-
+# reproducing Bull/Bear performance gap for (Bathtub/Cup & Handle
+# better in Bear, Breakout/Death Cross worse in Bear) — see that
+# script's docstring for the actual numbers. Golden Cross/Flag/
+# Overextended showed no reproducible effect or too small a sample, so
+# they deliberately get no regime-specific line here.
+REGIME_SENSITIVE_PATTERNS = {"Bathtub", "Cup & Handle", "Breakout", "Death Cross"}
+
+# Same sample floor analyze_market_regime.py required per regime-slice
+# before trusting a number — below this, the regime-specific stat is
+# just noise and showing it would be worse than not showing it.
+_MIN_REGIME_SAMPLE = 100
+
+
+def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame,
+                          regime_stats_df: pd.DataFrame = None,
+                          current_regime: str = None) -> str:
     """One pattern's historical win-rate/avg-return at the primary
     horizon, as a short string for the Candidates sheet. Falls back to
     an explicit "no data yet" rather than silently omitting the
     pattern, since a missing number and a bad number look identical
-    otherwise."""
+    otherwise.
+
+    For the 4 patterns with a validated regime effect
+    (REGIME_SENSITIVE_PATTERNS), also appends the stat conditioned on
+    TODAY's Bull/Bear regime when there's enough sample to trust it —
+    e.g. Death Cross's blended 44.6% win rate hides that it's far
+    worse specifically in Bear markets, which is exactly the regime a
+    Death Cross match is more likely to show up in."""
     if stats_df.empty or "Pattern" not in stats_df.columns:
         return f"{pattern}: no backtest data yet"
     row = stats_df[stats_df["Pattern"] == pattern]
@@ -49,8 +72,19 @@ def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame) -> str:
         return f"{pattern}: no backtest data yet"
     r = row.iloc[0]
     sign = "+" if r[ret_col] >= 0 else ""
-    return (f"{pattern}: {r[win_col]:.0f}% win / {sign}{r[ret_col]:.1f}% avg "
-            f"({_PRIMARY_HORIZON_DAYS}d, n={int(r['Sample Size'])})")
+    edge = f"{pattern}: {r[win_col]:.0f}%/{sign}{r[ret_col]:.1f}% (n={int(r['Sample Size'])})"
+
+    if (pattern in REGIME_SENSITIVE_PATTERNS and current_regime in ("Bull", "Bear")
+            and regime_stats_df is not None and not regime_stats_df.empty
+            and "Pattern" in regime_stats_df.columns):
+        rr = regime_stats_df[(regime_stats_df["Pattern"] == pattern)
+                              & (regime_stats_df["Regime"] == current_regime)]
+        if (not rr.empty and win_col in rr.columns and not pd.isna(rr.iloc[0][win_col])
+                and rr.iloc[0]["Sample Size"] >= _MIN_REGIME_SAMPLE):
+            rrow = rr.iloc[0]
+            rsign = "+" if rrow[ret_col] >= 0 else ""
+            edge += f" [{current_regime}: {rrow[win_col]:.0f}%/{rsign}{rrow[ret_col]:.1f}%]"
+    return edge
 
 
 # _pattern_backtest_is_weak used to live here; it's now
@@ -61,7 +95,6 @@ def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame) -> str:
 
 
 _SHEET_TAB_COLORS = {
-    "Legend": "#808080",
     "Top Picks": "#C00000",
     "Summary": "#1F3864",
     "My Positions": "#BF8F00",
@@ -233,50 +266,17 @@ def _write_sheet(writer, df: pd.DataFrame, sheet_name: str, highlight_col: str =
 def _ml_model_status_text() -> str:
     meta = model_metadata()
     if meta is None:
-        return "not trained yet — run train_recommendation_model.py"
-    status = "active" if meta.get("is_useful") else "trained, but not used (AUC too close to 0.5)"
-    auc = meta.get("test_auc")
-    return (f"{status} — {meta.get('horizon_days')}d horizon, test AUC={auc}, "
-            f"trained {meta.get('trained_at', '')[:10]}")
+        return "not trained"
+    status = "active" if meta.get("is_useful") else "not used (AUC too low)"
+    return f"{status} — {meta.get('horizon_days')}d, AUC={meta.get('test_auc')}"
 
 
-def _build_legend() -> pd.DataFrame:
-    """A short glossary sheet, placed first so it's the first thing
-    Excel shows — this report has accumulated enough columns across
-    enough sheets (HistoricalEdge, WeakBacktestPattern, MLWinProbability,
-    star ratings, two separate verdict vocabularies...) that "what does
-    this column mean" is a real question, not a hypothetical one."""
-    rows = [
-        ("Priority / stars (1-5)", "Candidates / Star Prospects",
-         "Pattern-confluence rating from modules/priority.py — more/cleaner agreeing patterns score higher; conflicting bullish+bearish patterns on the same ticker cancel out."),
-        ("Score", "Candidates",
-         "The raw numeric confluence score behind the star rating — can be negative for a conflicted ticker."),
-        ("HistoricalEdge", "Candidates",
-         "This pattern's measured win rate / average return over the 20-day horizon, from modules/backtest.py replaying 5 years of real history — not a guess, an empirical base rate."),
-        ("WeakBacktestPattern (red highlight)", "Candidates / Star Prospects",
-         "True if one of this ticker's matched patterns has a measured losing track record (below 45% win rate, negative avg return, 30+ historical matches) — e.g. Death Cross. Downgrades the Recommendation verdict."),
-        ("MLWinProbability (color scale)", "Candidates / By Pattern",
-         "Trained-model probability the pattern's predicted direction plays out, per train_recommendation_model.py. Blank/green-yellow-red scale only appears once a model has been trained AND cleared its own held-out accuracy bar — see the Summary sheet's 'ML win-probability model' row for whether that's currently true."),
-        ("Recommendation: BUY / WATCH / AVOID", "Candidates",
-         "modules/recommendation.py's verdict for a ticker you DON'T already own — combines stars, news sentiment, earnings timing, sector concentration, and WeakBacktestPattern."),
-        ("Action: BUY MORE / HOLD / WATCH / TRIM / SELL", "My Positions",
-         "modules/positions.py's verdict for a ticker you DO already own — combines your unrealized gain/loss % against cost basis with today's net pattern signal. A different scale from Recommendation on purpose: owning something changes the decision."),
-        ("My Options sheet", "My Options",
-         "Your open option contracts (parsed from the same Fidelity CSV) with a live market quote where available, falling back to Fidelity's own last price otherwise. UnderlyingDirection/UnderlyingPriority reuse that stock's own pattern scan — this is NOT options Greeks/IV-based pricing analysis, just a sanity check on whether the underlying's chart still agrees with the bet."),
-        ("Sector Exposure / Concentrated", "Sector Exposure",
-         "Share of your OPEN positions' dollar value in each sector. 'Concentrated' sectors (30%+) make Recommendation more conservative on new candidates in that same sector."),
-        ("SentimentLabel / AvgSentiment", "News Sentiment / Candidates / My Positions",
-         "VADER lexicon-based headline sentiment (modules/news_sentiment.py) — a quick signal, not nuanced; it won't catch something like 'beat earnings but guided down'."),
-        ("WinRate_Nd_pct / AvgReturn_Nd_pct", "By Pattern",
-         "This specific match's pattern's historical performance at the N-day forward horizon (5/10/20 trading days), from the backtest cache."),
-        ("Top Picks sheet", "Top Picks",
-         "A condensed digest of just the highest-conviction items across the whole report, for a fast read without opening all 14+ sheets: urgent forming signals on something you hold, options expiring within a week, and your top BUY calls ranked by stars/score. Everything here is also somewhere else in this file — this is a shortcut, not a different analysis."),
-        ("Track Record sheet", "Track Record",
-         "modules/tracking.py — every BUY/WATCH call this system has ever made, logged the day it was made, with its actual real-world outcome filled in once 20 trading days pass. This is the ONE thing on this whole report that isn't backtested against history — it's live, forward, and can't be curve-fit. Treat its win rate as the most honest number in this file, even though it'll take months to accumulate a meaningful sample."),
-        ("Forming Signals sheet", "Forming Signals",
-         "modules/pattern_forming.py — the SAME pattern geometry as the main detectors, caught while still in progress (e.g. 'Golden Cross projected in ~10 days' instead of waiting for the cross to already happen). Confidence (0-1) reflects how far along / clean the trend looks. NOT backtested the same rigorous way the completed patterns are — treat as an early heads-up to watch, not a validated edge."),
-    ]
-    return pd.DataFrame(rows, columns=["Term", "Where it shows up", "What it means"])
+def _current_regime_status_text() -> str:
+    from modules.market_data import get_current_regime
+    regime = get_current_regime()
+    if regime == "Unknown":
+        return "unknown — SPY not cached yet"
+    return f"{regime} (SPY vs 200d MA)"
 
 
 def _matches_by_ticker(matches: list) -> dict:
@@ -287,9 +287,11 @@ def _matches_by_ticker(matches: list) -> dict:
 
 
 def _build_candidates(tickers_df: pd.DataFrame, matches: list) -> pd.DataFrame:
-    from modules.market_data import passes_liquidity_filter, passes_activity_filter
+    from modules.market_data import passes_liquidity_filter, passes_activity_filter, get_current_regime
 
     pattern_stats_df = load_pattern_stats_cache()
+    regime_stats_df = load_pattern_stats_by_regime_cache()
+    current_regime = get_current_regime()
     by_ticker = _matches_by_ticker(matches)
     rows = []
     excluded_for_quality = 0
@@ -316,7 +318,10 @@ def _build_candidates(tickers_df: pd.DataFrame, matches: list) -> pd.DataFrame:
             "Patterns": ", ".join(distinct_patterns),
             "Directions": ", ".join(sorted({m.direction for m in group})),
             "Notes": " | ".join(m.note for m in group if m.note),
-            "HistoricalEdge": " | ".join(_format_pattern_edge(p, pattern_stats_df) for p in distinct_patterns),
+            "HistoricalEdge": " | ".join(
+                _format_pattern_edge(p, pattern_stats_df, regime_stats_df, current_regime)
+                for p in distinct_patterns
+            ),
             "WeakBacktestPattern": any(pattern_backtest_is_weak(p, pattern_stats_df) for p in distinct_patterns),
             # Average of this ticker's matched patterns' individual ML
             # win-probability predictions. None until the model exists
@@ -480,7 +485,7 @@ def build_report(tickers_df: pd.DataFrame, matches: list, earnings_df: pd.DataFr
     # invested dollars already sit in Technology, a fresh "BUY" call on
     # another tech name is a different decision than it looks in
     # isolation. See modules/sector_exposure.py.
-    sector_exposure_df = build_sector_exposure(positions_df)
+    sector_exposure_df = build_sector_exposure(positions_df, options_df)
     concentrated_sectors = set(
         sector_exposure_df[sector_exposure_df["Concentrated"]]["Sector"]
     ) if not sector_exposure_df.empty else set()
@@ -538,57 +543,68 @@ def build_report(tickers_df: pd.DataFrame, matches: list, earnings_df: pd.DataFr
         {"Metric": "Run date", "Value": dt.datetime.now().strftime("%A %B %d, %Y  %H:%M")},
         {"Metric": "Tickers scanned", "Value": run_stats.get("tickers_scanned")},
         {"Metric": "Elapsed (sec)", "Value": run_stats.get("elapsed_sec")},
-        {"Metric": "Candidates (2+ star)", "Value": len(candidates_df)},
+        {"Metric": "Candidates", "Value": len(candidates_df)},
         {"Metric": "5-star candidates", "Value": len(candidates_df[candidates_df["Priority"] == 5]) if not candidates_df.empty else 0},
-        {"Metric": "Candidates excluded (penny stock / low volume / inactive)", "Value": candidates_df.attrs.get("excluded_for_quality", 0)},
-        {"Metric": "New-stock BUY calls", "Value": len(candidates_df[candidates_df["Recommendation"] == "BUY"]) if not candidates_df.empty else 0},
-        {"Metric": "Open positions flagged SELL/TRIM", "Value": len(positions_report[positions_report["Action"].isin(["SELL", "TRIM"])]) if not positions_report.empty else 0},
-        {"Metric": "Forming signals (not yet complete)", "Value": len(forming_df) if not forming_df.empty else 0},
+        {"Metric": "Excluded (low quality)", "Value": candidates_df.attrs.get("excluded_for_quality", 0)},
+        {"Metric": "BUY calls", "Value": len(candidates_df[candidates_df["Recommendation"] == "BUY"]) if not candidates_df.empty else 0},
+        {"Metric": "Positions flagged SELL/TRIM", "Value": len(positions_report[positions_report["Action"].isin(["SELL", "TRIM"])]) if not positions_report.empty else 0},
+        {"Metric": "Forming signals", "Value": len(forming_df) if not forming_df.empty else 0},
         {"Metric": "Open option positions", "Value": len(options_report) if not options_report.empty else 0},
-        {"Metric": "Options expiring within 7 days", "Value": len(options_report[options_report["DaysToExpiration"] <= 7]) if not options_report.empty else 0},
-        {"Metric": "Tickers with earnings in next N days", "Value": len(earnings_view)},
-        {"Metric": "Bullish news sentiment", "Value": len(sentiment_df[sentiment_df["SentimentLabel"] == "Bullish"]) if not sentiment_df.empty else 0},
-        {"Metric": "Bearish news sentiment", "Value": len(sentiment_df[sentiment_df["SentimentLabel"] == "Bearish"]) if not sentiment_df.empty else 0},
+        {"Metric": "Options expiring soon", "Value": len(options_report[options_report["DaysToExpiration"] <= 7]) if not options_report.empty else 0},
+        {"Metric": "Earnings soon", "Value": len(earnings_view)},
+        {"Metric": "Bullish / Bearish sentiment", "Value": (
+            f"{len(sentiment_df[sentiment_df['SentimentLabel'] == 'Bullish'])} / "
+            f"{len(sentiment_df[sentiment_df['SentimentLabel'] == 'Bearish'])}"
+        ) if not sentiment_df.empty else "0 / 0"},
         {"Metric": "Largest sector exposure", "Value": (
             f"{sector_exposure_df.iloc[0]['Sector']} ({sector_exposure_df.iloc[0]['PortfolioPct']}%)"
-            if not sector_exposure_df.empty else "(no open positions)"
+            if not sector_exposure_df.empty else "(none)"
         )},
-        {"Metric": "Custom tickers requested this run", "Value": ", ".join(custom_tickers) if custom_tickers else "(none)"},
-        {"Metric": "ML win-probability model", "Value": _ml_model_status_text()},
-        {"Metric": "Live BUY-call track record", "Value": (
+        {"Metric": "Custom tickers", "Value": ", ".join(custom_tickers) if custom_tickers else "(none)"},
+        {"Metric": "ML model", "Value": _ml_model_status_text()},
+        {"Metric": "Market regime", "Value": _current_regime_status_text()},
+        {"Metric": "Live track record", "Value": (
             f"{int(track_summary_df.iloc[1]['Value'])} resolved / {int(track_summary_df.iloc[2]['Value'])} pending"
             if not track_summary_df.empty else "no calls logged yet"
         )},
     ]
     summary_df = pd.DataFrame(summary_rows)
 
-    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
-        _write_sheet(writer, _build_legend(), "Legend")
-        _write_sheet(writer, top_picks_df, "Top Picks")
-        _write_sheet(writer, summary_df, "Summary")
-        _write_sheet(writer, positions_report, "My Positions", highlight_col="Action",
-                     warn_bool_col="WeakBacktestPattern")
-        _write_sheet(writer, options_report, "My Options")
-        _write_sheet(writer, candidates_df, "Candidates", highlight_col="Recommendation",
-                     warn_bool_col="WeakBacktestPattern", scale_col="MLWinProbability")
-        for stars in (5, 4, 3):
-            tier_df = candidates_df[candidates_df["Priority"] == stars] if not candidates_df.empty else pd.DataFrame()
-            _write_sheet(writer, tier_df, f"{stars} Star Prospects",
+    def _write_workbook(path):
+        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+            _write_sheet(writer, top_picks_df, "Top Picks")
+            _write_sheet(writer, summary_df, "Summary")
+            _write_sheet(writer, positions_report, "My Positions", highlight_col="Action",
+                         warn_bool_col="WeakBacktestPattern")
+            _write_sheet(writer, options_report, "My Options")
+            _write_sheet(writer, candidates_df, "Candidates", highlight_col="Recommendation",
                          warn_bool_col="WeakBacktestPattern", scale_col="MLWinProbability")
-        _write_sheet(writer, earnings_view, "Earnings Watch")
-        _write_sheet(writer, sentiment_df.sort_values("AvgSentiment", ascending=False) if not sentiment_df.empty else sentiment_df,
-                     "News Sentiment")
-        _write_sheet(writer, sector_exposure_df, "Sector Exposure")
-        _write_sheet(writer, by_pattern_df, "By Pattern", scale_col="MLWinProbability")
-        _write_sheet(writer, forming_df, "Forming Signals", scale_col="Confidence")
-        _write_sheet(writer, track_log_df, "Track Record", good_bad_col="Correct")
-        _write_sheet(writer, zigzag_df, "ZigZag")
+            for stars in (5, 4, 3):
+                tier_df = candidates_df[candidates_df["Priority"] == stars] if not candidates_df.empty else pd.DataFrame()
+                _write_sheet(writer, tier_df, f"{stars} Star Prospects",
+                             warn_bool_col="WeakBacktestPattern", scale_col="MLWinProbability")
+            _write_sheet(writer, earnings_view, "Earnings Watch")
+            _write_sheet(writer, sentiment_df.sort_values("AvgSentiment", ascending=False) if not sentiment_df.empty else sentiment_df,
+                         "News Sentiment")
+            _write_sheet(writer, sector_exposure_df, "Sector Exposure")
+            _write_sheet(writer, by_pattern_df, "By Pattern", scale_col="MLWinProbability")
+            _write_sheet(writer, forming_df, "Forming Signals", scale_col="Confidence")
+            _write_sheet(writer, track_log_df, "Track Record", good_bad_col="Correct")
+            _write_sheet(writer, zigzag_df, "ZigZag")
 
-        # First sheet Excel opens to — put the Legend tab before all
-        # others in the physical tab order (writing order above already
-        # does this, but worksheets.set_first_sheet pins it even if a
-        # user has previously reordered tabs in a file with this name).
-        writer.sheets["Legend"].set_first_sheet()
+            # First sheet Excel opens to (writing order above already does
+            # this, but set_first_sheet pins it even if a user has
+            # previously reordered tabs in a file with this name).
+            writer.sheets["Top Picks"].set_first_sheet()
+
+    try:
+        _write_workbook(out_path)
+    except PermissionError:
+        # Same-day rerun while the earlier report is still open in Excel
+        # locks the dated filename — fall back to a timestamped one
+        # rather than losing the whole run's results.
+        out_path = DIR_OUTPUTS / f"ScreenerReport_{today}_{dt.datetime.now().strftime('%H%M%S')}.xlsx"
+        _write_workbook(out_path)
 
     highlights = {
         "buy_calls": len(candidates_df[candidates_df["Recommendation"] == "BUY"]) if not candidates_df.empty else 0,

@@ -156,6 +156,28 @@ def _fetch_one(ticker: str, period: str, retries: int, backoff_base: int) -> tup
     return pd.DataFrame(), str(last_err)
 
 
+def _detect_split_discontinuity(existing: pd.DataFrame, fresh: pd.DataFrame) -> bool:
+    """True if the fresh fetch and the existing cache disagree
+    materially on the SAME calendar date's Close. Yahoo returns
+    split-adjusted closes for a ticker's whole history on every
+    fetch — so after a new split, a fresh fetch's view of an old,
+    already-cached date retroactively changes scale (e.g. halves)
+    relative to what's sitting in the cache from before the split
+    happened. Merging the two as-is (the plain incremental path)
+    would leave a scale jump at the seam that every detector's
+    pct-change math would read as a real multi-hundred-percent move.
+    >5% disagreement on an identical date/ticker is never normal
+    fetch noise — it means the two fetches are on different
+    adjustment eras."""
+    if existing.empty or fresh.empty:
+        return False
+    overlap = existing.merge(fresh, on="Date", suffixes=("_old", "_new"))
+    if overlap.empty:
+        return False
+    ratio = overlap["Close_new"] / overlap["Close_old"]
+    return bool((ratio < 0.95).any() or (ratio > 1.05).any())
+
+
 def _refresh_one_ticker(ticker: str, retries: int, backoff: int, delay: float, force_full: bool) -> dict:
     """Runs on a worker thread. Fetches + writes cache for one ticker,
     returns a small status dict instead of mutating shared state directly
@@ -188,6 +210,19 @@ def _refresh_one_ticker(ticker: str, retries: int, backoff: int, delay: float, f
             return {"ticker": ticker, "status": "full_backfill"}
         else:
             existing = get_history(ticker)
+            if _detect_split_discontinuity(existing, fresh):
+                # A split happened since the last full backfill — fetch
+                # the whole history again (one extra request, only on
+                # this rare path) so the entire cached series moves
+                # onto the same current adjustment era, instead of
+                # merging two eras together with a scale jump at the
+                # seam.
+                full, full_reason = _fetch_one(ticker, SETTINGS["history_period_full"], retries, backoff)
+                if full.empty:
+                    return {"ticker": ticker, "status": "failed", "reason": full_reason}
+                full.to_csv(cache_path, index=False)
+                return {"ticker": ticker, "status": "full_backfill", "note": "split re-backfill"}
+
             combined = pd.concat([existing, fresh], ignore_index=True)
             combined = combined.drop_duplicates(subset="Date", keep="last")
             combined = combined.sort_values("Date").reset_index(drop=True)
@@ -312,7 +347,7 @@ def refresh_all_history(tickers: list, log=print) -> dict:
     concurrent workers, a longer per-request delay — rather than
     hammering an already-throttling endpoint the same way again."""
     meta = _load_meta()
-    result = {"full_backfill": 0, "incremental": 0, "failed": []}
+    result = {"full_backfill": 0, "incremental": 0, "failed": [], "split_detected": []}
     current_period = SETTINGS["history_period_full"]
 
     retries = SETTINGS["fetch_max_retries"]
@@ -361,6 +396,8 @@ def refresh_all_history(tickers: list, log=print) -> dict:
             else:
                 succeeded.append(outcome["ticker"])
                 result[status] += 1
+                if outcome.get("note") == "split re-backfill":
+                    result["split_detected"].append(outcome["ticker"])
                 with meta_lock:
                     prior = meta.get(outcome["ticker"])
                     prior_period = prior.get("backfill_period") if isinstance(prior, dict) else None
@@ -380,6 +417,47 @@ def refresh_all_history(tickers: list, log=print) -> dict:
     _save_fetch_state(result["failed"], failure_rate)
     update_dead_ticker_tracking(succeeded, result["failed"], log=log)
     return result
+
+
+# Standard, widely-used broad-market trend heuristic: "Bull" if the
+# index closes above its own 200-day moving average, "Bear" otherwise
+# — the same mechanism modules/pattern_golden_cross.py already applies
+# to individual stocks, just applied to the market itself. See
+# analyze_market_regime.py for the backtested evidence that several
+# patterns (Bathtub/Cup & Handle, Breakout, Death Cross) perform
+# meaningfully differently depending on this.
+REGIME_BENCHMARK_TICKER = "SPY"
+REGIME_MA_WINDOW = 200
+
+
+def get_current_regime() -> str:
+    """Returns 'Bull', 'Bear', or 'Unknown' (if SPY isn't cached yet
+    or doesn't have enough history for the 200-day MA)."""
+    spy = get_history(REGIME_BENCHMARK_TICKER)
+    if len(spy) < REGIME_MA_WINDOW:
+        return "Unknown"
+    spy = spy.sort_values("Date")
+    ma200 = spy["Close"].tail(REGIME_MA_WINDOW).mean()
+    last_close = spy["Close"].iloc[-1]
+    return "Bull" if last_close > ma200 else "Bear"
+
+
+def get_regime_lookup() -> "pd.Series":
+    """Date -> 'Bull'/'Bear' for every historical date SPY has enough
+    trailing history to compute the 200-day MA — used to backtest
+    pattern performance conditioned on the regime at match time (see
+    modules/backtest.py's summarize_by_regime and
+    analyze_market_regime.py). Empty Series if SPY isn't cached."""
+    spy = get_history(REGIME_BENCHMARK_TICKER)
+    if spy.empty:
+        return pd.Series(dtype=object)
+    spy = spy.sort_values("Date").reset_index(drop=True)
+    spy["MA200"] = spy["Close"].rolling(REGIME_MA_WINDOW).mean()
+    spy = spy.dropna(subset=["MA200"])
+    return pd.Series(
+        data=["Bull" if c > m else "Bear" for c, m in zip(spy["Close"], spy["MA200"])],
+        index=pd.to_datetime(spy["Date"]).values,
+    )
 
 
 if __name__ == "__main__":

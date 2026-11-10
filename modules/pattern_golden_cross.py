@@ -64,6 +64,12 @@ def detect_golden_cross(df: pd.DataFrame, params: dict = None) -> PatternMatch:
             "fast_ma": round(df["fast_ma"].iloc[cross_idx], 2),
             "slow_ma": round(df["slow_ma"].iloc[cross_idx], 2),
             "cross_price": round(df["Close"].iloc[cross_idx], 2),
+            # Already computed above for vol_confirms/the note string —
+            # surfaced here too so modules/backtest.py can record them
+            # per-match instead of just the pass/fail vol_confirms flag,
+            # for threshold tuning against real backtested outcomes.
+            "volume_mult": round(df["Volume"].iloc[cross_idx] / vol_recent, 2) if vol_recent else None,
+            "bars_since_cross": len(df) - 1 - cross_idx,
         },
         volume_confirms=vol_confirms,
         note=f"{p['fast_window']}MA crossed {'above' if direction == 'bullish' else 'below'} "

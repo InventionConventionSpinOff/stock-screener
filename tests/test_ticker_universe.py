@@ -128,8 +128,43 @@ def test_thinkorswim_option_section_parsed_via_options_module(thinkorswim_csv):
     assert row["LastPrice"] == 4.8  # Mark
 
 
-def test_resolver_prefers_configured_path_when_it_exists(fidelity_csv):
-    assert ticker_universe.resolve_portfolio_csv_path() == fidelity_csv
+def test_resolver_picks_newest_csv_regardless_of_name(tmp_path, monkeypatch):
+    # An OLDER export happens to sit at the configured default
+    # filename; a NEWER export (re-downloaded under the broker's own
+    # auto-generated name) sits right next to it. The newer one must
+    # win — filename is not a proxy for freshness.
+    monkeypatch.setitem(PATHS, "portfolio_csv", tmp_path / "Fidelity_Positions.csv")
+
+    old_default = tmp_path / "Fidelity_Positions.csv"
+    old_default.write_text("Symbol,Quantity\nAAPL,1\n")
+    new_export = tmp_path / "Portfolio_Positions_Nov-09-2026.csv"
+    new_export.write_text("Symbol,Quantity\nMSFT,1\n")
+
+    import os
+    import time
+    old_time = time.time() - 3600
+    os.utime(old_default, (old_time, old_time))
+
+    assert ticker_universe.resolve_portfolio_csv_path() == new_export
+
+
+def test_resolver_picks_newest_even_when_it_is_the_configured_name(tmp_path, monkeypatch):
+    # Same setup, but this time the configured-named file is the
+    # NEWER one — it should still win on recency, not because of its
+    # name.
+    monkeypatch.setitem(PATHS, "portfolio_csv", tmp_path / "Fidelity_Positions.csv")
+
+    older_export = tmp_path / "Portfolio_Positions_Oct-01-2026.csv"
+    older_export.write_text("Symbol,Quantity\nMSFT,1\n")
+    import os
+    import time
+    old_time = time.time() - 3600
+    os.utime(older_export, (old_time, old_time))
+
+    newer_default = tmp_path / "Fidelity_Positions.csv"
+    newer_default.write_text("Symbol,Quantity\nAAPL,1\n")
+
+    assert ticker_universe.resolve_portfolio_csv_path() == newer_default
 
 
 def test_resolver_falls_back_to_any_csv_in_inputs_dir(tmp_path, monkeypatch):
@@ -141,7 +176,6 @@ def test_resolver_falls_back_to_any_csv_in_inputs_dir(tmp_path, monkeypatch):
     # directly, so a Schwab user always saw a false "not found" warning.
     missing_default = tmp_path / "Fidelity_Positions.csv"
     monkeypatch.setitem(PATHS, "portfolio_csv", missing_default)
-    monkeypatch.setattr(ticker_universe, "DIR_INPUTS", tmp_path)
     other_csv = tmp_path / "Schwab_Export_Whatever_Name.csv"
     other_csv.write_text("Symbol,Quantity\nAAPL,1\n")
     assert ticker_universe.resolve_portfolio_csv_path() == other_csv
@@ -149,6 +183,5 @@ def test_resolver_falls_back_to_any_csv_in_inputs_dir(tmp_path, monkeypatch):
 
 def test_resolver_returns_configured_path_when_nothing_exists(tmp_path, monkeypatch):
     missing = tmp_path / "Fidelity_Positions.csv"
-    monkeypatch.setitem(PATHS, "portfolio_csv", missing)
-    monkeypatch.setattr(ticker_universe, "DIR_INPUTS", tmp_path)  # empty — no CSV to fall back to
+    monkeypatch.setitem(PATHS, "portfolio_csv", missing)  # tmp_path is empty — no CSV to fall back to
     assert ticker_universe.resolve_portfolio_csv_path() == missing

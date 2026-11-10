@@ -118,6 +118,16 @@ def backtest_ticker(ticker: str, detectors: list = None, forward_days: list = No
                 # (a "textbook" Cup & Handle and a "barely qualifies" one
                 # currently get treated identically by this flattened row).
                 "Quality": round(_match_quality(m), 3),
+                # Raw geometric numbers behind the Quality score, for
+                # tune_pattern_thresholds.py to bucket real outcomes by
+                # actual threshold value instead of just the aggregate
+                # score — None for patterns that don't expose this
+                # particular key_level (Breakout/Golden/Death Cross
+                # have volume_mult; Overextension has gain_pct; Golden/
+                # Death Cross have bars_since_cross; everything else NaN).
+                "VolumeMult": m.key_levels.get("volume_mult"),
+                "GainPct": m.key_levels.get("gain_pct"),
+                "BarsSinceCross": m.key_levels.get("bars_since_cross"),
             }
             for fd in forward_days:
                 exit_price = df["Close"].iloc[t + fd]
@@ -191,6 +201,72 @@ def summarize(matches_df: pd.DataFrame, forward_days: list = None) -> pd.DataFra
     if sort_col in out.columns:
         out = out.sort_values(sort_col, ascending=False).reset_index(drop=True)
     return out
+
+
+def summarize_by_regime(matches_df: pd.DataFrame, forward_days: list = None) -> pd.DataFrame:
+    """Same rollup as summarize(), but split by the broad market's
+    Bull/Bear regime at match time (modules.market_data.get_regime_lookup)
+    instead of blended across all history. analyze_market_regime.py
+    found real, held-out-reproducing regime effects for several
+    patterns (e.g. Death Cross is far worse specifically in Bear
+    markets, -8.33% avg return vs. -0.86% in Bull) that a single
+    blended number hides entirely."""
+    from modules.market_data import get_regime_lookup
+
+    forward_days = forward_days or DEFAULT_FORWARD_DAYS
+    if matches_df.empty:
+        return pd.DataFrame()
+
+    regime = get_regime_lookup()
+    if regime.empty:
+        return pd.DataFrame()
+
+    df = matches_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Regime"] = df["Date"].map(regime)
+    df = df.dropna(subset=["Regime"])
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (pattern, regime_label), group in df.groupby(["Pattern", "Regime"]):
+        row = {"Pattern": pattern, "Regime": regime_label, "Sample Size": len(group)}
+        for fd in forward_days:
+            col = f"SignedReturn_{fd}d_pct"
+            if col not in group.columns:
+                continue
+            row[f"WinRate_{fd}d_pct"] = round((group[col] > 0).mean() * 100, 1)
+            row[f"AvgReturn_{fd}d_pct"] = round(group[col].mean(), 2)
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(["Pattern", "Regime"]).reset_index(drop=True)
+
+
+def save_pattern_stats_by_regime_cache(summary_df: pd.DataFrame, log=print) -> None:
+    """Writes the regime-split summary to a fixed-name cache, parallel
+    to save_pattern_stats_cache's blended version."""
+    from config import PATHS
+
+    cache_path = PATHS["pattern_stats_by_regime_cache"]
+    if summary_df.empty:
+        log("No regime-split stats to cache (SPY not cached yet, or no matches) — left untouched.")
+        return
+    summary_df.to_csv(cache_path, index=False)
+    log(f"Regime-split pattern stats cache updated -> {cache_path}")
+
+
+def load_pattern_stats_by_regime_cache() -> pd.DataFrame:
+    """Returns the cached regime-split summary (Pattern, Regime, Sample
+    Size, WinRate_Nd_pct, AvgReturn_Nd_pct), or empty if not yet built."""
+    from config import PATHS
+
+    cache_path = PATHS["pattern_stats_by_regime_cache"]
+    if not os.path.exists(cache_path):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(cache_path)
+    except (pd.errors.EmptyDataError, OSError):
+        return pd.DataFrame()
 
 
 def save_pattern_stats_cache(summary_df: pd.DataFrame, log=print) -> None:

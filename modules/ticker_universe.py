@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import requests
 
-from config import PATHS, SETTINGS, DIR_INPUTS
+from config import PATHS, SETTINGS
 
 WIKI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -114,14 +114,21 @@ def read_broker_csv(csv_path) -> pd.DataFrame:
 
 
 def resolve_portfolio_csv_path():
-    """PATHS["portfolio_csv"] if it exists; otherwise the first *.csv
-    found in inputs/ — so a Schwab (or any other broker) export can
-    just be dropped in under its own natural filename instead of
-    needing to be renamed to match the Fidelity-specific default."""
+    """The most RECENTLY MODIFIED *.csv in inputs/ — so a Schwab (or
+    any other broker) export can just be dropped in under its own
+    natural filename instead of needing to be renamed to match the
+    Fidelity-specific default, AND re-exporting always picks up the
+    fresh file instead of a stale one. Previously this preferred the
+    fixed default filename over everything else in the folder even
+    when a newer, differently-named export sat right next to it —
+    the exact way a stale export could silently keep getting read
+    after a fresh one was dropped in under the broker's own
+    auto-generated name. Falls back to the configured default path
+    (even though it won't exist) only when inputs/ has no CSV at
+    all, so the caller's "not found" error still names a real path."""
     configured = Path(PATHS["portfolio_csv"])
-    if configured.exists():
-        return configured
-    candidates = sorted(DIR_INPUTS.glob("*.csv"))
+    search_dir = configured.parent
+    candidates = sorted(search_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0] if candidates else configured
 
 

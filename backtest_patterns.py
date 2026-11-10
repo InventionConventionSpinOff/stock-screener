@@ -34,8 +34,8 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from config import SETTINGS
 from modules.backtest import (
-    run_backtest, summarize, save_backtest_report,
-    save_pattern_stats_cache, save_raw_matches_cache,
+    run_backtest, summarize, summarize_by_regime, save_backtest_report,
+    save_pattern_stats_cache, save_pattern_stats_by_regime_cache, save_raw_matches_cache,
 )
 
 
@@ -91,6 +91,9 @@ def main():
 
     save_pattern_stats_cache(summary_df, log=print)
     save_raw_matches_cache(matches_df, log=print)
+
+    regime_summary_df = summarize_by_regime(matches_df)
+    save_pattern_stats_by_regime_cache(regime_summary_df, log=print)
 
 
 if __name__ == "__main__":

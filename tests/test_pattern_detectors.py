@@ -20,6 +20,7 @@ from modules.pattern_golden_cross import detect_golden_cross
 from modules.pattern_breakout import detect_breakout
 from modules.pattern_bathtub import detect_bathtub
 from modules.pattern_overextension import detect_overextension
+from modules.pattern_double import detect_double
 
 
 def _make_df(closes, volumes=None, start="2020-01-01"):
@@ -42,6 +43,7 @@ def test_flat_noise_triggers_nothing():
     assert detect_breakout(df) is None
     assert detect_bathtub(df) is None
     assert detect_overextension(df) is None
+    assert detect_double(df) is None
 
 
 def test_golden_cross_fires_on_a_clean_uptrend_after_a_downtrend():
@@ -110,3 +112,47 @@ def test_overextension_fires_on_a_parabolic_run():
     m = detect_overextension(df)
     assert m is not None
     assert m.direction == "bearish"  # risk flag, not a buy signal
+
+
+def test_double_top_fires_on_two_similar_peaks_then_a_fresh_neckline_break():
+    # X (peak, bar 20, 150) -> Y (trough/neckline, bar 35, 120) -> Z
+    # (second peak, bar 50, ~149, within 3% of X) -> gradual decline to
+    # bar 60 (121, still ABOVE the neckline — not broken yet) -> bar 61
+    # (115, a FRESH break below 120). The second-to-last close must
+    # stay above the neckline, or the detector's own freshness check
+    # (yesterday not already broken) rejects the match.
+    up1 = np.linspace(100, 150, 21)
+    down1 = np.linspace(150, 120, 16)[1:]
+    up2 = np.linspace(120, 149, 16)[1:]
+    down2 = np.linspace(149, 121, 11)[1:]
+    final = [115.0]
+    df = _make_df(np.concatenate([up1, down1, up2, down2, final]))
+    m = detect_double(df)
+    assert m is not None
+    assert m.pattern == "Double Top"
+    assert m.direction == "bearish"
+
+
+def test_double_bottom_fires_on_two_similar_troughs_then_a_fresh_neckline_break():
+    # Mirror image of the double-top shape above.
+    down1 = np.linspace(150, 100, 21)
+    up1 = np.linspace(100, 130, 16)[1:]
+    down2 = np.linspace(130, 101, 16)[1:]
+    up2 = np.linspace(101, 129, 11)[1:]
+    final = [135.0]
+    df = _make_df(np.concatenate([down1, up1, down2, up2, final]))
+    m = detect_double(df)
+    assert m is not None
+    assert m.pattern == "Double Bottom"
+    assert m.direction == "bullish"
+
+
+def test_double_top_does_not_fire_without_a_fresh_break():
+    # Same shape as the double-top test above, but stop one bar early —
+    # the neckline hasn't been crossed yet (last close still above it).
+    up1 = np.linspace(100, 150, 21)
+    down1 = np.linspace(150, 120, 16)[1:]
+    up2 = np.linspace(120, 149, 16)[1:]
+    down2 = np.linspace(149, 121, 11)[1:]
+    df = _make_df(np.concatenate([up1, down1, up2, down2]))
+    assert detect_double(df) is None

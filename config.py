@@ -75,6 +75,13 @@ PATHS = {
     # backtest_patterns.py has been run at least once.
     "pattern_stats_cache": DIR_CACHE / "pattern_stats.csv",
 
+    # Same per-pattern stats, split by Bull/Bear market regime at
+    # match time instead of blended — see analyze_market_regime.py and
+    # modules/backtest.py's summarize_by_regime for why the blended
+    # number can hide a real, large effect (e.g. Death Cross is far
+    # worse specifically in Bear markets).
+    "pattern_stats_by_regime_cache": DIR_CACHE / "pattern_stats_by_regime.csv",
+
     # Raw match-level backtest output (one row per historical match,
     # see modules/backtest.py's Quality column) — the training set
     # train_recommendation_model.py reads from.
