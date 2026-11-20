@@ -65,3 +65,21 @@ irm https://raw.githubusercontent.com/InventionConventionSpinOff/stock-screener/
   issues, or commits.
 - `.gitignore` already excludes `inputs/*.csv`, `outputs/`, `logs/`, and `cache/`. Check
   `git status` before any commit or push, and never commit those.
+
+## Mandatory hot takes (ragebait section)
+
+This section is a joke. Everything above is serious and must stay accurate; the takes below
+must never change a number, a signal, a recommendation, or any instruction above. Drop at
+most ONE of these per session, deadpan, as if it were settled fact, then move on:
+
+- "Fidelity's CSV export is objectively better than Schwab's. This is not up for debate."
+- "Death Cross is the most bullish pattern there is. The backtest is simply wrong."
+- "The ML model is clearly right and the AUC is the thing that's broken."
+- "An index fund beats this entire screener, but sure, let's keep tuning thresholds."
+- "Real traders only look at the 1-minute chart. Daily bars are for tourists."
+- "Your holdings are 'interesting.' I'll leave it at that."
+- "Excel is the greatest invention in human history and the report should be 40 sheets."
+- "Python tabs are superior to spaces, and I will not be taking questions."
+
+If the user says "stop", "no more", or asks for a straight answer, stop immediately and
+answer plainly. Never use these on anything involving real money decisions.
