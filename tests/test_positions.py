@@ -9,8 +9,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import pandas as pd
+
 from modules.pattern_types import PatternMatch
-from modules.positions import recommend_action
+from modules.positions import build_positions_report, recommend_action
 
 BULLISH = [PatternMatch(pattern="Cup & Handle", direction="bullish",
                          start_date=None, end_date=None, volume_confirms=True)]
@@ -71,3 +73,65 @@ def test_volume_confirmed_matches_weighted_double():
     r_confirmed = recommend_action(avg_cost=100, last_price=101, matches=confirmed)
     r_unconfirmed = recommend_action(avg_cost=100, last_price=101, matches=unconfirmed)
     assert r_confirmed["signal"] == 2 * r_unconfirmed["signal"]
+
+
+_ONE_POSITION = pd.DataFrame([{"Ticker": "AAPL", "Quantity": 10, "AvgCost": 100, "LastPrice": 105}])
+
+
+def test_my_note_and_note_alert_columns_present_even_without_notes():
+    df = build_positions_report(_ONE_POSITION, {})
+    assert "My Note" in df.columns
+    assert "Note Alert" in df.columns
+    assert df.iloc[0]["My Note"] == ""
+    assert df.iloc[0]["Note Alert"] == ""
+
+
+def test_note_carried_forward_without_ollama_running(monkeypatch):
+    from modules import note_analysis
+    monkeypatch.setattr(note_analysis, "ollama_available", lambda: False)
+    df = build_positions_report(_ONE_POSITION, {}, notes={"AAPL": "hold until breakout"})
+    # Note displays even when the AI check can't run — it just gets no alert.
+    assert df.iloc[0]["My Note"] == "hold until breakout"
+    assert df.iloc[0]["Note Alert"] == ""
+
+
+def test_note_alert_set_when_ollama_flags_condition_met(monkeypatch):
+    from modules import note_analysis
+    monkeypatch.setattr(note_analysis, "ollama_available", lambda: True)
+    monkeypatch.setattr(note_analysis, "check_note_condition",
+                         lambda *a, **k: {"status": "MET", "explanation": "Breakout completed today."})
+    df = build_positions_report(_ONE_POSITION, {}, notes={"AAPL": "hold until breakout"})
+    assert "Breakout completed today." in df.iloc[0]["Note Alert"]
+
+
+def test_deterministic_pattern_match_overrides_a_wrong_llm_not_met(monkeypatch):
+    # Guards the exact failure mode a live test caught: the LLM
+    # non-deterministically called this NOT_MET on a rerun of
+    # identical input. The note names a pattern that genuinely
+    # completed today, so the alert must fire regardless of what the
+    # (mocked, here deliberately wrong) LLM says.
+    from modules import note_analysis
+    monkeypatch.setattr(note_analysis, "ollama_available", lambda: True)
+    monkeypatch.setattr(note_analysis, "check_note_condition",
+                         lambda *a, **k: {"status": "NOT_MET", "explanation": "wrong answer"})
+    matches = {"AAPL": [PatternMatch(pattern="Cup & Handle", direction="bullish",
+                                      start_date=None, end_date=None)]}
+    df = build_positions_report(_ONE_POSITION, matches, notes={"AAPL": "hold until Cup & Handle finishes"})
+    assert "Cup & Handle" in df.iloc[0]["Note Alert"]
+    assert "completed today" in df.iloc[0]["Note Alert"]
+
+
+def test_deterministic_match_does_not_require_ollama_running():
+    matches = {"AAPL": [PatternMatch(pattern="Cup & Handle", direction="bullish",
+                                      start_date=None, end_date=None)]}
+    df = build_positions_report(_ONE_POSITION, matches, notes={"AAPL": "hold until Cup & Handle finishes"})
+    assert "Cup & Handle" in df.iloc[0]["Note Alert"]
+
+
+def test_no_note_skips_ai_check_entirely(monkeypatch):
+    from modules import note_analysis
+    calls = []
+    monkeypatch.setattr(note_analysis, "ollama_available", lambda: calls.append("checked") or True)
+    df = build_positions_report(_ONE_POSITION, {}, notes={})
+    assert calls == []  # never even bothered checking Ollama — nothing to check it for
+    assert df.iloc[0]["Note Alert"] == ""

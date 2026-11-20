@@ -23,7 +23,10 @@ from modules.swing_points import swing_sequence
 from modules.news_sentiment import get_news_sentiment
 from modules.recommendation import recommend_buy
 from modules.sector_exposure import build_sector_exposure, get_sectors
-from modules.backtest import load_pattern_stats_cache, load_pattern_stats_by_regime_cache, pattern_backtest_is_weak
+from modules.backtest import (load_pattern_stats_cache, load_pattern_stats_by_regime_cache,
+                               pattern_backtest_is_weak_now,
+                               REGIME_SENSITIVE_PATTERNS, MIN_REGIME_SAMPLE as _MIN_REGIME_SAMPLE,
+                               SECTOR_SENSITIVE_PATTERNS, MIN_SECTOR_SAMPLE as _MIN_SECTOR_SAMPLE)
 from modules.ml_recommend import predict_win_probability, model_metadata
 
 # The forward-day horizon shown as a single summary figure on the
@@ -34,23 +37,11 @@ from modules.ml_recommend import predict_win_probability, model_metadata
 _PRIMARY_HORIZON_DAYS = 20
 
 
-# The 4 patterns analyze_market_regime.py found a real, held-out-
-# reproducing Bull/Bear performance gap for (Bathtub/Cup & Handle
-# better in Bear, Breakout/Death Cross worse in Bear) — see that
-# script's docstring for the actual numbers. Golden Cross/Flag/
-# Overextended showed no reproducible effect or too small a sample, so
-# they deliberately get no regime-specific line here.
-REGIME_SENSITIVE_PATTERNS = {"Bathtub", "Cup & Handle", "Breakout", "Death Cross"}
-
-# Same sample floor analyze_market_regime.py required per regime-slice
-# before trusting a number — below this, the regime-specific stat is
-# just noise and showing it would be worse than not showing it.
-_MIN_REGIME_SAMPLE = 100
-
-
 def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame,
                           regime_stats_df: pd.DataFrame = None,
-                          current_regime: str = None) -> str:
+                          current_regime: str = None,
+                          sector_stats_df: pd.DataFrame = None,
+                          ticker_sector: str = None) -> str:
     """One pattern's historical win-rate/avg-return at the primary
     horizon, as a short string for the Candidates sheet. Falls back to
     an explicit "no data yet" rather than silently omitting the
@@ -62,7 +53,10 @@ def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame,
     TODAY's Bull/Bear regime when there's enough sample to trust it —
     e.g. Death Cross's blended 44.6% win rate hides that it's far
     worse specifically in Bear markets, which is exactly the regime a
-    Death Cross match is more likely to show up in."""
+    Death Cross match is more likely to show up in. Separately, for
+    Death Cross specifically (SECTOR_SENSITIVE_PATTERNS), also appends
+    the stat conditioned on this ticker's own sector when there's
+    enough sample — worst in Financial Services, least-bad in Healthcare."""
     if stats_df.empty or "Pattern" not in stats_df.columns:
         return f"{pattern}: no backtest data yet"
     row = stats_df[stats_df["Pattern"] == pattern]
@@ -84,6 +78,17 @@ def _format_pattern_edge(pattern: str, stats_df: pd.DataFrame,
             rrow = rr.iloc[0]
             rsign = "+" if rrow[ret_col] >= 0 else ""
             edge += f" [{current_regime}: {rrow[win_col]:.0f}%/{rsign}{rrow[ret_col]:.1f}%]"
+
+    if (pattern in SECTOR_SENSITIVE_PATTERNS and ticker_sector
+            and sector_stats_df is not None and not sector_stats_df.empty
+            and "Pattern" in sector_stats_df.columns):
+        sr = sector_stats_df[(sector_stats_df["Pattern"] == pattern)
+                              & (sector_stats_df["Sector"] == ticker_sector)]
+        if (not sr.empty and win_col in sr.columns and not pd.isna(sr.iloc[0][win_col])
+                and sr.iloc[0]["Sample Size"] >= _MIN_SECTOR_SAMPLE):
+            srow = sr.iloc[0]
+            ssign = "+" if srow[ret_col] >= 0 else ""
+            edge += f" [{ticker_sector}: {srow[win_col]:.0f}%/{ssign}{srow[ret_col]:.1f}%]"
     return edge
 
 
@@ -122,8 +127,8 @@ _LITERAL_PCT_SUFFIXES = ("pct", "%")
 # 100 and add %" percent format is the correct one.
 _FRACTION_PCT_COLS = {"MLWinProbability"}
 # Long free-text columns worth wrapping instead of truncating.
-_WRAP_COLS = {"Notes", "Note", "RecommendationWhy", "Description", "Reason", "HistoricalEdge", "TopHeadline",
-              "What it means"}
+_WRAP_COLS = {"Notes", "Note", "My Note", "Note Alert", "AI Outlook", "RecommendationWhy", "Description",
+              "Reason", "HistoricalEdge", "TopHeadline", "What it means"}
 
 
 def _number_format_for_column(col_name: str) -> str:
@@ -288,11 +293,15 @@ def _matches_by_ticker(matches: list) -> dict:
 
 def _build_candidates(tickers_df: pd.DataFrame, matches: list) -> pd.DataFrame:
     from modules.market_data import passes_liquidity_filter, passes_activity_filter, get_current_regime
+    from modules.backtest import load_pattern_stats_by_sector_cache
+    from modules.sector_exposure import get_sectors
 
     pattern_stats_df = load_pattern_stats_cache()
     regime_stats_df = load_pattern_stats_by_regime_cache()
+    sector_stats_df = load_pattern_stats_by_sector_cache()
     current_regime = get_current_regime()
     by_ticker = _matches_by_ticker(matches)
+    ticker_sector_map = get_sectors(list(by_ticker.keys())) if by_ticker else {}
     rows = []
     excluded_for_quality = 0
     for ticker, group in by_ticker.items():
@@ -319,10 +328,15 @@ def _build_candidates(tickers_df: pd.DataFrame, matches: list) -> pd.DataFrame:
             "Directions": ", ".join(sorted({m.direction for m in group})),
             "Notes": " | ".join(m.note for m in group if m.note),
             "HistoricalEdge": " | ".join(
-                _format_pattern_edge(p, pattern_stats_df, regime_stats_df, current_regime)
+                _format_pattern_edge(p, pattern_stats_df, regime_stats_df, current_regime,
+                                      sector_stats_df, ticker_sector_map.get(ticker))
                 for p in distinct_patterns
             ),
-            "WeakBacktestPattern": any(pattern_backtest_is_weak(p, pattern_stats_df) for p in distinct_patterns),
+            "WeakBacktestPattern": any(
+                pattern_backtest_is_weak_now(p, pattern_stats_df, regime_stats_df, current_regime,
+                                              sector_stats_df, ticker_sector_map.get(ticker))
+                for p in distinct_patterns
+            ),
             # Average of this ticker's matched patterns' individual ML
             # win-probability predictions. None until the model exists
             # and has cleared its own held-out usefulness bar — see
@@ -379,12 +393,21 @@ def _build_top_picks(candidates_df: pd.DataFrame, forming_matches: list,
     return df.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
 
 
-def _build_forming_signals(forming_matches: list) -> pd.DataFrame:
+def _build_forming_signals(forming_matches: list, pattern_stats_df: pd.DataFrame = None) -> pd.DataFrame:
     """Leading-edge signals from modules/pattern_forming.py — setups
     still in progress, not yet complete. Deliberately kept separate
     from Candidates/By Pattern: these aren't backtested the way the
     completed patterns are, so mixing them in would overstate how much
-    validation is actually behind them."""
+    validation is actually behind them.
+
+    Adds an "AI Outlook" column: a one-sentence local-LLM paraphrase of
+    the facts already in the row (pattern, confidence, geometry note,
+    the completed-pattern's backtested edge) for the highest-confidence
+    rows only (see SETTINGS["forming_signals_ai_outlook_top_n"]). This
+    is pure paraphrasing, not a judgment call — unlike
+    modules.note_analysis.check_note_condition, nothing here drives
+    any BUY/HOLD/SELL decision, so a so-so sentence is cosmetic, not a
+    risk the way a wrong note-condition verdict would be."""
     if not forming_matches:
         return pd.DataFrame()
     rows = []
@@ -395,9 +418,22 @@ def _build_forming_signals(forming_matches: list) -> pd.DataFrame:
             "Direction": m.direction,
             "Confidence": m.confidence,
             "Note": m.note,
+            "AI Outlook": "",
         })
     df = pd.DataFrame(rows)
-    return df.sort_values(["Confidence", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+    df = df.sort_values(["Confidence", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+
+    from modules.note_analysis import ollama_available, summarize_forming_signal
+    if ollama_available():
+        top_n = SETTINGS.get("forming_signals_ai_outlook_top_n", 15)
+        for i in df.head(top_n).index:
+            row = df.loc[i]
+            edge = _format_pattern_edge(row["Pattern"], pattern_stats_df) \
+                if pattern_stats_df is not None else "no backtest data yet"
+            df.at[i, "AI Outlook"] = summarize_forming_signal(
+                row["Ticker"], row["Pattern"], row["Direction"], row["Confidence"], row["Note"], edge
+            )
+    return df
 
 
 def _build_by_pattern(matches: list) -> pd.DataFrame:
@@ -458,7 +494,7 @@ def build_report(tickers_df: pd.DataFrame, matches: list, earnings_df: pd.DataFr
 
     candidates_df = _build_candidates(tickers_df, matches)
     by_pattern_df = _build_by_pattern(matches)
-    forming_df = _build_forming_signals(forming_matches)
+    forming_df = _build_forming_signals(forming_matches, load_pattern_stats_cache())
 
     portfolio_tickers = set(positions_df["Ticker"]) if positions_df is not None and not positions_df.empty else set()
     candidate_tickers = set(candidates_df["Ticker"]) if not candidates_df.empty else set()
@@ -522,8 +558,17 @@ def build_report(tickers_df: pd.DataFrame, matches: list, earnings_df: pd.DataFr
     positions_report = pd.DataFrame()
     if positions_df is not None and not positions_df.empty:
         from modules.positions import build_positions_report
+        from modules.notes import load_previous_notes
+        from modules.market_data import get_current_regime
+        from modules.backtest import load_pattern_stats_by_sector_cache
+        previous_notes = load_previous_notes()
+        forming_by_ticker = _matches_by_ticker(forming_matches) if forming_matches else {}
         positions_report = build_positions_report(positions_df, _matches_by_ticker(matches),
-                                                    load_pattern_stats_cache())
+                                                    load_pattern_stats_cache(), notes=previous_notes,
+                                                    forming_by_ticker=forming_by_ticker,
+                                                    regime_stats_df=load_pattern_stats_by_regime_cache(),
+                                                    current_regime=get_current_regime(),
+                                                    sector_stats_df=load_pattern_stats_by_sector_cache())
         if not sentiment_df.empty:
             positions_report = positions_report.merge(
                 sentiment_df[["Ticker", "SentimentLabel", "AvgSentiment"]], on="Ticker", how="left"

@@ -82,6 +82,13 @@ PATHS = {
     # worse specifically in Bear markets).
     "pattern_stats_by_regime_cache": DIR_CACHE / "pattern_stats_by_regime.csv",
 
+    # Same per-pattern stats, split by each matched ticker's GICS
+    # sector instead of blended — see analyze_sector_performance.py
+    # and modules/backtest.py's summarize_by_sector. Only Death Cross
+    # showed a real, held-out-reproducing sector effect; every other
+    # pattern's apparent sector differences didn't survive the test split.
+    "pattern_stats_by_sector_cache": DIR_CACHE / "pattern_stats_by_sector.csv",
+
     # Raw match-level backtest output (one row per historical match,
     # see modules/backtest.py's Quality column) — the training set
     # train_recommendation_model.py reads from.
@@ -133,7 +140,13 @@ SETTINGS = {
     "fetch_max_retries": 3,
     "fetch_backoff_base_sec": 5,
     "fetch_politeness_delay_sec": 0.3,
-    "fetch_max_workers": 16,
+    # Benchmarked 2026-11-09 at 16/24/32 workers against the live
+    # incremental-refresh path (200-ticker samples): 24 and 32 both
+    # showed real speedups over 16 with zero rate-limiting or
+    # failures at any level tested. 24 picked as a safe step up
+    # rather than jumping straight to the untested full-universe
+    # behavior of 32.
+    "fetch_max_workers": 24,
 
     # A ticker that fails to fetch this many runs IN A ROW, with no
     # successful fetch EVER (never produced a usable cache file), is
@@ -170,6 +183,22 @@ SETTINGS = {
     "swing_order": 5,
     "zigzag_lookback_bars": 252,      # ~1y of bars considered per ticker
     "zigzag_legs_per_ticker": 5,      # most recent N legs kept, bounds sheet size
+
+    # Local LLM note-condition checking (modules/note_analysis.py) —
+    # runs entirely on-machine via Ollama, no cloud API/key. If Ollama
+    # isn't installed or isn't running, this silently degrades to no
+    # AI check (your notes still display and carry forward either
+    # way) — see modules.note_analysis.ollama_available.
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "llama3.2:3b",
+
+    # Forming Signals can run into the hundreds on an all-us scan —
+    # capping how many get an AI paraphrase keeps a single weekly run
+    # from ballooning by one local-LLM call per signal. Rows beyond
+    # this (already sorted by Confidence descending) just get no
+    # outlook text, same graceful-degradation pattern as everywhere
+    # else this local model is used.
+    "forming_signals_ai_outlook_top_n": 15,
 
     # Logging
     "log_output": "both",

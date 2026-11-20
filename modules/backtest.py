@@ -242,6 +242,73 @@ def summarize_by_regime(matches_df: pd.DataFrame, forward_days: list = None) -> 
     return pd.DataFrame(rows).sort_values(["Pattern", "Regime"]).reset_index(drop=True)
 
 
+def summarize_by_sector(matches_df: pd.DataFrame, forward_days: list = None) -> pd.DataFrame:
+    """Same rollup as summarize(), but split by each matched ticker's
+    GICS sector (modules.sector_exposure.get_sectors) instead of
+    blended across every sector. analyze_sector_performance.py found a
+    real, held-out-reproducing sector effect for Death Cross
+    specifically — worst in Financial Services, least-bad in
+    Healthcare — out of all 9 patterns tested; everything else's
+    apparent sector differences didn't survive the train/test split.
+    Sector is a ticker-level property here (unlike Regime, which
+    varies by match date), so this just needs one lookup per distinct
+    ticker rather than a per-date map."""
+    from modules.sector_exposure import get_sectors
+
+    forward_days = forward_days or DEFAULT_FORWARD_DAYS
+    if matches_df.empty:
+        return pd.DataFrame()
+
+    tickers = sorted(matches_df["Ticker"].unique())
+    sector_map = get_sectors(tickers)
+
+    df = matches_df.copy()
+    df["Sector"] = df["Ticker"].map(sector_map)
+    df = df[df["Sector"].notna() & (df["Sector"] != "Unknown")]
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (pattern, sector), group in df.groupby(["Pattern", "Sector"]):
+        row = {"Pattern": pattern, "Sector": sector, "Sample Size": len(group)}
+        for fd in forward_days:
+            col = f"SignedReturn_{fd}d_pct"
+            if col not in group.columns:
+                continue
+            row[f"WinRate_{fd}d_pct"] = round((group[col] > 0).mean() * 100, 1)
+            row[f"AvgReturn_{fd}d_pct"] = round(group[col].mean(), 2)
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(["Pattern", "Sector"]).reset_index(drop=True)
+
+
+def save_pattern_stats_by_sector_cache(summary_df: pd.DataFrame, log=print) -> None:
+    """Writes the sector-split summary to a fixed-name cache, parallel
+    to save_pattern_stats_by_regime_cache's regime-split version."""
+    from config import PATHS
+
+    cache_path = PATHS["pattern_stats_by_sector_cache"]
+    if summary_df.empty:
+        log("No sector-split stats to cache (sectors not resolved yet, or no matches) — left untouched.")
+        return
+    summary_df.to_csv(cache_path, index=False)
+    log(f"Sector-split pattern stats cache updated -> {cache_path}")
+
+
+def load_pattern_stats_by_sector_cache() -> pd.DataFrame:
+    """Returns the cached sector-split summary (Pattern, Sector, Sample
+    Size, WinRate_Nd_pct, AvgReturn_Nd_pct), or empty if not yet built."""
+    from config import PATHS
+
+    cache_path = PATHS["pattern_stats_by_sector_cache"]
+    if not os.path.exists(cache_path):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(cache_path)
+    except (pd.errors.EmptyDataError, OSError):
+        return pd.DataFrame()
+
+
 def save_pattern_stats_by_regime_cache(summary_df: pd.DataFrame, log=print) -> None:
     """Writes the regime-split summary to a fixed-name cache, parallel
     to save_pattern_stats_cache's blended version."""
@@ -326,9 +393,39 @@ PRIMARY_HORIZON_DAYS = 20
 # damning if the wins are much bigger than the losses. Requiring a
 # minimum sample size keeps this from firing off a thin, noisy slice
 # of history (e.g. Flag's ~44-match sample) the way it legitimately
-# should for Death Cross (~38% win rate across 300+ matches).
-WEAK_BACKTEST_WIN_RATE_FLOOR = 45.0
+# should for Death Cross.
+#
+# Raised from 45.0 to 46.0 on 2026-11-09 after a fresh 121,100-match
+# backtest showed Double Top at 45.9% win / -1.55% avg return (20d) —
+# a real losing pattern that the old 45.0 floor missed by a tenth of a
+# point. Checked the rest of that run's per-pattern table before
+# raising it: nothing else sits in the 45-46% band, so this isn't
+# loosening the gate for anything that shouldn't be caught (Breakout
+# at 48.7% stays excluded anyway since its avg return is positive).
+WEAK_BACKTEST_WIN_RATE_FLOOR = 46.0
 WEAK_BACKTEST_MIN_SAMPLE = 30
+
+# The 4 patterns analyze_market_regime.py found a real, held-out-
+# reproducing Bull/Bear performance gap for (Bathtub/Cup & Handle
+# better in Bear, Breakout/Death Cross worse in Bear) — see that
+# script's docstring for the actual numbers. Mirrored by
+# modules/report_screener.py's REGIME_SENSITIVE_PATTERNS, which
+# imports this set rather than keeping its own copy.
+REGIME_SENSITIVE_PATTERNS = {"Bathtub", "Cup & Handle", "Breakout", "Death Cross"}
+
+# Same sample floor analyze_market_regime.py required per regime-slice
+# before trusting a number — below this, the regime-specific stat is
+# just noise and acting on it would be worse than falling back to the
+# blended one.
+MIN_REGIME_SAMPLE = 100
+
+# The only pattern analyze_sector_performance.py found a real, held-
+# out-reproducing sector effect for (worst in Financial Services,
+# least-bad in Healthcare — train +8.4pp win-rate gap, test +5.6pp).
+# Every other pattern's apparent sector split didn't survive the
+# train/test check, so this set deliberately stays narrow.
+SECTOR_SENSITIVE_PATTERNS = {"Death Cross"}
+MIN_SECTOR_SAMPLE = 100
 
 
 def pattern_backtest_is_weak(pattern: str, stats_df: pd.DataFrame) -> bool:
@@ -354,6 +451,89 @@ def ticker_has_weak_backtest_pattern(matches: list, stats_df: pd.DataFrame) -> b
     """Convenience wrapper — True if ANY of this ticker's matched
     patterns individually qualifies as historically weak."""
     return any(pattern_backtest_is_weak(m.pattern, stats_df) for m in matches)
+
+
+def pattern_backtest_is_weak_now(pattern: str, stats_df: pd.DataFrame,
+                                  regime_stats_df: pd.DataFrame = None,
+                                  current_regime: str = None,
+                                  sector_stats_df: pd.DataFrame = None,
+                                  ticker_sector: str = None) -> bool:
+    """Same weak/not-weak gate as pattern_backtest_is_weak, but checks
+    two independent conditioning signals first, each only for the
+    specific pattern(s) it was validated for:
+
+    - REGIME: for the 4 patterns with a validated regime effect
+      (REGIME_SENSITIVE_PATTERNS), checks TODAY's Bull/Bear-specific
+      track record instead of the blended one whenever there's enough
+      regime-sliced sample to trust it (>=MIN_REGIME_SAMPLE).
+    - SECTOR: for Death Cross specifically (SECTOR_SENSITIVE_PATTERNS),
+      checks this ticker's own sector's track record whenever there's
+      enough sector-sliced sample to trust it (>=MIN_SECTOR_SAMPLE).
+
+    Either signal returning "weak" is enough to call it weak — they're
+    independent, both real, reproduced effects (a Death Cross in
+    Financial Services during a Bear regime is bad for two separate
+    reasons, not one). Falls back to the blended pattern_backtest_is_weak
+    only when neither conditioning signal applies or has enough sample
+    to trust.
+
+    This matters because the blended number can hide the real risk:
+    Death Cross's blended stats already clear the weak bar on their
+    own, but its Bear-market-specific and Financial-Services-specific
+    numbers are each considerably worse — and a Death Cross is also
+    more likely to actually fire in exactly those conditions, which
+    the blended check has no way to know. Previously the regime split
+    only drove the Candidates sheet's display text
+    (modules/report_screener.py's _format_pattern_edge); it didn't
+    change any actual BUY MORE / HOLD / WATCH decision until this
+    function started being used for that gate directly."""
+    win_col = f"WinRate_{PRIMARY_HORIZON_DAYS}d_pct"
+    ret_col = f"AvgReturn_{PRIMARY_HORIZON_DAYS}d_pct"
+
+    # Each trustworthy specific signal fully overrides the blended
+    # verdict on its own (a trustworthy "not weak" sector/regime
+    # reading is more reliable than the blended number, same as the
+    # original regime-only version of this gate) — collected into a
+    # list rather than returned immediately so that when BOTH signals
+    # are applicable and disagree, either one calling it weak wins
+    # (see test_regime_and_sector_signals_are_independent_either_can_flag_weak).
+    specific_verdicts = []
+
+    if (pattern in REGIME_SENSITIVE_PATTERNS and current_regime in ("Bull", "Bear")
+            and regime_stats_df is not None and not regime_stats_df.empty
+            and "Pattern" in regime_stats_df.columns):
+        rr = regime_stats_df[(regime_stats_df["Pattern"] == pattern)
+                              & (regime_stats_df["Regime"] == current_regime)]
+        if (not rr.empty and win_col in rr.columns and not pd.isna(rr.iloc[0][win_col])
+                and rr.iloc[0]["Sample Size"] >= MIN_REGIME_SAMPLE):
+            r = rr.iloc[0]
+            specific_verdicts.append(r[win_col] < WEAK_BACKTEST_WIN_RATE_FLOOR and r[ret_col] < 0)
+
+    if (pattern in SECTOR_SENSITIVE_PATTERNS and ticker_sector
+            and sector_stats_df is not None and not sector_stats_df.empty
+            and "Pattern" in sector_stats_df.columns):
+        sr = sector_stats_df[(sector_stats_df["Pattern"] == pattern)
+                              & (sector_stats_df["Sector"] == ticker_sector)]
+        if (not sr.empty and win_col in sr.columns and not pd.isna(sr.iloc[0][win_col])
+                and sr.iloc[0]["Sample Size"] >= MIN_SECTOR_SAMPLE):
+            r = sr.iloc[0]
+            specific_verdicts.append(r[win_col] < WEAK_BACKTEST_WIN_RATE_FLOOR and r[ret_col] < 0)
+
+    if specific_verdicts:
+        return any(specific_verdicts)
+    return pattern_backtest_is_weak(pattern, stats_df)
+
+
+def ticker_has_weak_backtest_pattern_now(matches: list, stats_df: pd.DataFrame,
+                                          regime_stats_df: pd.DataFrame = None,
+                                          current_regime: str = None,
+                                          sector_stats_df: pd.DataFrame = None,
+                                          ticker_sector: str = None) -> bool:
+    """Convenience wrapper around pattern_backtest_is_weak_now, parallel
+    to ticker_has_weak_backtest_pattern's blended-only version."""
+    return any(pattern_backtest_is_weak_now(m.pattern, stats_df, regime_stats_df, current_regime,
+                                             sector_stats_df, ticker_sector)
+               for m in matches)
 
 
 def save_backtest_report(matches_df: pd.DataFrame, summary_df: pd.DataFrame) -> "os.PathLike":
