@@ -1,6 +1,15 @@
 Stock Screener - Setup
 ======================
 
+Download / update
+-----------------
+Open PowerShell and paste this one line. First time it installs the
+screener to  %USERPROFILE%\stock-screener ; any time after that it
+updates it in place. Either way it prints the folder path at the end.
+Your own files (inputs, outputs, cache, logs) are never touched.
+
+  irm https://raw.githubusercontent.com/InventionConventionSpinOff/stock-screener/master/get-screener.ps1 | iex
+
 1. Export your Positions as a CSV (from Schwab's website or from
    thinkorswim's Position Statement) and save it anywhere inside the
    "inputs" folder (any filename is fine).
